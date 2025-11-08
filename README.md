@@ -6,8 +6,8 @@
 ---
 
 ## 👥 Grupo
-1. RA - Nome 1 - Backend e integração com RDS  
-2. RA - Nome 2 - Configuração AWS ECS e API Gateway  
+1. 10401908 - Giulia Barros Gondim - Backend e integração com RDS  
+2. 10416808 - Gabriel Bello - Configuração AWS ECS e API Gateway  
 
 
 ---
