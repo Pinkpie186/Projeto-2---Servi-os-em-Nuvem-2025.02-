@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Infra para IoT Sensor Monitor - VPC, RDS, ECS Fargate, ALB, API GW, Lambda (simplificado)
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.10.0/24
+  DBUsername:
+    Type: String
+    Default: admin
+  DBPassword:
+    Type: String
+    NoEcho: true
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  EcrImageUri:
+    Type: String
+    Description: "URI completo da imagem ECR (ex: 12345.dkr.ecr.sa-east-1.amazonaws.com/iot-api:latest)"
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: iot-vpc }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      MapPublicIpOnLaunch: false
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  RTAssocPublic:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachIGW
+    Properties: { Domain: vpc }
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  RTAssocPrivate:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  SecurityGroupALB:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from Internet to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  SecurityGroupECS:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ALB to ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref SecurityGroupALB
+
+  SecurityGroupRDS:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Postgres from ECS SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref SecurityGroupECS
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets privadas para RDS
+      SubnetIds: [ !Ref PrivateSubnet ]
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: iot-sensors-db
+      AllocatedStorage: !Ref DBAllocatedStorage
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      EngineVersion: "15.3"
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [ !Ref SecurityGroupRDS ]
+      PubliclyAccessible: false
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: iot-ecs-cluster
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ecsTaskExecutionRole-iot
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: iot-task
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [ FARGATE ]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: iot-api
+          Image: !Ref EcrImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3000
+          Environment:
+            - Name: DB_HOST
+              Value: !GetAtt RDSInstance.Endpoint.Address
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_USER
+              Value: !Ref DBUsername
+            - Name: DB_PASS
+              Value: !Ref DBPassword
+            - Name: DB_NAME
+              Value: sensors_db
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: iot-alb
+      Subnets: [ !Ref PublicSubnet ]
+      SecurityGroups: [ !Ref SecurityGroupALB ]
+      Scheme: internet-facing
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /health
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref TaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: [ !Ref SecurityGroupECS ]
+          Subnets: [ !Ref PrivateSubnet ]
+      LoadBalancers:
+        - TargetGroupArn: !Ref ALBTargetGroup
+          ContainerName: iot-api
+          ContainerPort: 3000
+
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: IoTApiGateway
+
+  ApiGatewayResourceReport:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: report
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ReportLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-exec-report-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ReportLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: iot-report-lambda
+      Handler: handler.handler
+      Role: !GetAtt ReportLambdaRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 30
+      Environment:
+        Variables:
+          ALB_DNS: !GetAtt ALB.DNSName
+      Code:
+        ZipFile: |
+          const https = require('https');
+          const http = require('http');
+          const fetch = (url) => new Promise((resolve, reject) => {
+            const lib = url.startsWith('https') ? https : http;
+            lib.get(url, (res) => {
+              let data = '';
+              res.on('data', chunk => data += chunk);
+              res.on('end', () => resolve({ status: res.statusCode, body: data }));
+            }).on('error', reject);
+          });
+
+          exports.handler = async () => {
+            try {
+              const alb = process.env.ALB_DNS;
+              const url = `http://${alb}/readings`;
+              const r = await fetch(url);
+              if(r.status !== 200) throw new Error('Erro ao buscar API');
+              const readings = JSON.parse(r.body);
+              const total = readings.length;
+              const byType = {};
+              readings.forEach(item => {
+                const t = item.type;
+                byType[t] = byType[t] || {count:0, sum:0};
+                byType[t].count += 1;
+                byType[t].sum += Number(item.value);
+              });
+              const stats = {};
+              Object.keys(byType).forEach(k => { stats[k] = {count: byType[k].count, avg: +(byType[k].sum / byType[k].count).toFixed(2)}; });
+              const recent = readings.slice(0,5);
+              return { statusCode: 200, body: JSON.stringify({ totalReadings: total, statsByType: stats, recent }) };
+            } catch (err) {
+              return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
+            }
+          };
+
+  ApiGatewayMethodReport:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayResourceReport
+      RestApiId: !Ref ApiGatewayRestApi
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ReportLambda.Arn}/invocations
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [ApiGatewayMethodReport]
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: prod
+
+  LambdaPermissionForApiGW:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReportLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/GET/report
+
+Outputs:
+  ALB_DNS:
+    Description: ALB DNS Name
+    Value: !GetAtt ALB.DNSName
+  ApiGatewayInvokeURL:
+    Description: API Gateway invoke URL (prod)
+    Value: !Sub https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+  RDS_Endpoint:
+    Description: RDS Endpoint
+    Value: !GetAtt RDSInstance.Endpoint.Address
