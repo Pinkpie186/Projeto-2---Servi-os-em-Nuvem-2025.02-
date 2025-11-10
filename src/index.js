@@ -47,4 +47,5 @@ app.delete('/readings/:id', async (req,res) => {
 app.get('/health', (_,res) => res.json({status: 'ok'}));
 
 const port = process.env.PORT || 3000;
-app.listen(port, ()=> console.log(`API listening on ${port}`));
+// app.listen(port, () => console.log(`API listening on ${port}`));
+app.listen(port, '0.0.0.0', () => console.log(`API listening on ${port}`));
